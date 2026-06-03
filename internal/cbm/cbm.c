@@ -11,6 +11,7 @@
 #include "lsp/cs_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/rust_lsp.h"
 #include "preprocessor.h"
 #include "foundation/compat.h"
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
@@ -510,6 +511,9 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     }
     if (language == CBM_LANG_KOTLIN) {
         cbm_run_kotlin_lsp(a, result, source, source_len, root);
+    }
+    if (language == CBM_LANG_RUST) {
+        cbm_run_rust_lsp(a, result, source, source_len, root);
     }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
