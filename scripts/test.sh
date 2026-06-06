@@ -69,4 +69,10 @@ if [ "${CBM_RUN_HANG_TEST:-0}" = "1" ]; then
     bash "$ROOT/tests/test_cpp_index_hang.sh"
 fi
 
+# Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
+# binary and verifies it self-exits when its launching parent is killed.
+echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
+$ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
+bash "$ROOT/tests/test_parent_watchdog.sh"
+
 echo "=== All tests passed ==="
