@@ -12,6 +12,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "git/git_context.h"
+#include "foundation/dump_verify.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -269,6 +270,75 @@ TEST(pipeline_structure_nodes) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_test_repo();
+    PASS();
+}
+
+/* Issue #516: an ADR stored via manage_adr (project_summaries) must survive a
+ * full re-index. A full re-index deletes the DB and rebuilds it from the graph
+ * buffer, which writes an empty project_summaries table; the fix captures the
+ * ADR before the delete and restores it after the rebuild. Reproduce-first:
+ * index, store an ADR, force a full re-index by adding files, assert the ADR
+ * is still present and unchanged. */
+TEST(pipeline_adr_survives_full_reindex) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+
+    /* Initial index with a single source file. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    const char *project = cbm_pipeline_project_name(p1);
+    char project_copy[256];
+    snprintf(project_copy, sizeof(project_copy), "%s", project);
+    cbm_pipeline_free(p1);
+
+    /* Store an ADR. */
+    const char *adr_text = "# Decision\nWe chose X over Y.";
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_EQ(cbm_store_adr_store(s1, project_copy, adr_text), CBM_STORE_OK);
+    cbm_store_close(s1);
+
+    /* Force a full re-index: add enough files to exceed the incremental
+     * threshold so the DB is deleted and rebuilt. */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
+
+    /* The ADR must still be present and unchanged. */
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_adr_t adr = {0};
+    int rc = cbm_store_adr_get(s2, project_copy, &adr);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s2);
+
+    rm_rf(tmp);
     PASS();
 }
 
@@ -6030,6 +6100,48 @@ TEST(pipeline_complexity_transitive_loop_depth) {
     PASS();
 }
 
+/* Regression for #334: the plausibility gate compares committed (extracted)
+ * node count against persisted rows. committed_nodes must be captured BEFORE
+ * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
+ * the gate is silently inert. Drives the real pipeline (not a synthetic count)
+ * and asserts committed_nodes is populated and matches what was persisted. */
+TEST(pipeline_committed_counts_match_persisted) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/committed_test.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    int committed_nodes = -1;
+    int committed_edges = -1;
+    cbm_pipeline_get_committed_counts(p, &committed_nodes, &committed_edges);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    int persisted_nodes = cbm_store_count_nodes(s, project);
+    cbm_store_close(s);
+
+    /* The bug captured committed_nodes after the node index was freed → 0. */
+    ASSERT_GT(committed_nodes, 0);
+    /* A faithful full dump persists exactly what it committed. */
+    ASSERT_EQ(committed_nodes, persisted_nodes);
+    /* The gate must NOT flag a healthy full index as degraded. */
+    ASSERT_FALSE(cbm_dump_verify_is_degraded(committed_nodes, persisted_nodes,
+                                             CBM_DUMP_VERIFY_DEFAULT_RATIO,
+                                             CBM_DUMP_VERIFY_MIN_FLOOR));
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -6048,6 +6160,8 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_committed_counts_match_persisted);
+    RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);

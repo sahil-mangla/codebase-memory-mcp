@@ -54,6 +54,7 @@ enum {
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/str_util.h"
+#include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
 
@@ -390,9 +391,13 @@ static const tool_def_t TOOLS[] = {
      "structure at a glance. Includes 'clusters': Leiden community detection over the call/import "
      "graph, surfacing the de-facto modules (each with a label, member count, cohesion score, "
      "representative top_nodes, and the packages/edge_types that bind it) — use these to grasp "
-     "the real architectural seams, which often cut across the folder layout.",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"aspects\":{\"type\":"
-     "\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]}"},
+     "the real architectural seams, which often cut across the folder layout. Optional path scopes "
+     "analysis to nodes under that directory prefix (file_path).",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":"
+     "\"string\",\"description\":\"Optional directory prefix to scope architecture (e.g. "
+     "apps/hoa)\"},"
+     "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
+     "}"},
 
     {"search_code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
@@ -953,7 +958,7 @@ static bool is_project_db_file(const char *name, size_t len) {
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, const struct stat *st) {
+                                     const char *name, size_t name_len, int64_t size_bytes) {
     char project_name[CBM_SZ_1K];
     snprintf(project_name, sizeof(project_name), "%.*s", (int)(name_len - 3), name);
 
@@ -985,7 +990,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     add_git_context_json(doc, p, root_path_buf[0] ? root_path_buf : NULL);
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
-    yyjson_mut_obj_add_int(doc, p, "size_bytes", (int64_t)st->st_size);
+    yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
     yyjson_mut_arr_add_val(arr, p);
 }
 
@@ -1024,11 +1029,11 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         }
         char full_path[CBM_SZ_2K];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
-        struct stat st;
-        if (stat(full_path, &st) != 0) {
+        int64_t size_bytes = cbm_file_size(full_path);
+        if (size_bytes < 0) {
             continue;
         }
-        build_project_json_entry(doc, arr, dir_path, name, len, &st);
+        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
     }
     cbm_closedir(d);
 
@@ -1916,12 +1921,14 @@ static void append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
+    char *scope_path = cbm_mcp_get_string_arg(args, "path");
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
         free(project);
+        free(scope_path);
         return not_indexed;
     }
 
@@ -1961,14 +1968,17 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     /* Counts-only: this handler renders label/type counts but never property
      * keys, and full key discovery json_each-scans every row (seconds-to-
      * minutes on multi-million-node graphs). */
-    cbm_store_get_schema_counts(store, project, &schema);
+    cbm_store_get_schema_counts_scoped(store, project, scope_path, &schema);
 
     cbm_architecture_info_t arch = {0};
-    cbm_store_get_architecture(store, project, aspects_strs_count > 0 ? aspects_strs : NULL,
-                               aspects_strs_count, &arch);
+    cbm_store_get_architecture(store, project, scope_path,
+                               aspects_strs_count > 0 ? aspects_strs : NULL, aspects_strs_count,
+                               &arch);
 
-    int node_count = cbm_store_count_nodes(store, project);
-    int edge_count = cbm_store_count_edges(store, project);
+    int node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
+    int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
+    char norm_path[CBM_SZ_512];
+    bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -1976,6 +1986,15 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     if (project) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
+    }
+    if (path_scoped) {
+        yyjson_mut_obj_add_str(doc, root, "path", norm_path);
+        int root_nodes = cbm_store_count_nodes(store, project);
+        int root_edges = cbm_store_count_edges(store, project);
+        yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_nodes);
+        yyjson_mut_obj_add_int(doc, root, "root_total_edges", root_edges);
+        yyjson_mut_obj_add_int(doc, root, "scoped_total_nodes", node_count);
+        yyjson_mut_obj_add_int(doc, root, "scoped_total_edges", edge_count);
     }
     yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count);
@@ -2192,6 +2211,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_doc_free(aspects_doc);
     }
     free(project);
+    free(scope_path);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -2653,8 +2673,7 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
 static void try_artifact_bootstrap(const char *project_name, const char *repo_path) {
     char db_buf[CBM_SZ_1K];
     project_db_path(project_name, db_buf, sizeof(db_buf));
-    struct stat db_st;
-    if (stat(db_buf, &db_st) != 0 && cbm_artifact_exists(repo_path)) {
+    if (cbm_file_size(db_buf) < 0 && cbm_artifact_exists(repo_path)) {
         cbm_log_info("index.artifact_bootstrap", "project", project_name);
         cbm_artifact_import(repo_path, db_buf);
     }
@@ -2687,28 +2706,82 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
     yyjson_mut_obj_add_val(doc, root, "excluded", excluded);
 }
 
-/* Build the success portion of the index_repository response. */
-static void build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
+/* Build the success portion of the index_repository response.
+ * Returns true when status should be "degraded" (#334 plausibility gate). */
+static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
                                          yyjson_mut_val *root, const char *project_name,
-                                         const char *repo_path, bool persistence,
+                                         const char *repo_path, bool persistence, cbm_pipeline_t *p,
                                          char **excluded_dirs, int excluded_count) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
 
+    int exp_nodes = -1;
+    int exp_edges = -1;
+    cbm_pipeline_get_committed_counts(p, &exp_nodes, &exp_edges);
+
+    const double ratio = cbm_dump_verify_min_ratio();
+    const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
+
     cbm_store_t *store = resolve_store(srv, project_name);
+    int nodes = 0;
+    int edges = 0;
+    bool degraded = false;
+
     if (!store) {
-        return;
+        degraded = true;
+    } else {
+        nodes = cbm_store_count_nodes(store, project_name);
+        edges = cbm_store_count_edges(store, project_name);
+        if (nodes < 0) {
+            degraded = true;
+            nodes = 0;
+            edges = edges >= 0 ? edges : 0;
+        } else if (cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor)) {
+            (void)cbm_store_checkpoint(store);
+            int nodes2 = cbm_store_count_nodes(store, project_name);
+            int edges2 = cbm_store_count_edges(store, project_name);
+            if (nodes2 >= 0) {
+                nodes = nodes2;
+            }
+            if (edges2 >= 0) {
+                edges = edges2;
+            }
+            degraded = cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor);
+        }
     }
-    int nodes = cbm_store_count_nodes(store, project_name);
-    int edges = cbm_store_count_edges(store, project_name);
+
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
+    if (exp_nodes >= 0) {
+        yyjson_mut_obj_add_int(doc, root, "expected_nodes", exp_nodes);
+        yyjson_mut_obj_add_int(doc, root, "expected_edges", exp_edges);
+    }
+
+    if (degraded) {
+        if (!store) {
+            yyjson_mut_obj_add_str(doc, root, "hint",
+                                   "Index database failed integrity check and was removed. "
+                                   "Re-run index_repository(repo_path=...) to rebuild.");
+            cbm_log_warn("dump.verify", "reason", "store_missing", "expected_nodes",
+                         exp_nodes >= 0 ? "set" : "unknown");
+        } else {
+            char exp_buf[MCP_FIELD_SIZE];
+            char got_buf[MCP_FIELD_SIZE];
+            snprintf(exp_buf, sizeof(exp_buf), "%d", exp_nodes);
+            snprintf(got_buf, sizeof(got_buf), "%d", nodes);
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                "Persisted far fewer nodes than indexed — likely durability loss from a "
+                "hard-killed sibling process. Re-run index_repository(repo_path=...) to rebuild.");
+            cbm_log_warn("dump.verify", "expected_nodes", exp_buf, "persisted_nodes", got_buf);
+        }
+    }
 
     char adr_path[CBM_SZ_4K];
     snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", repo_path);
     struct stat adr_st;
     bool adr_exists = (stat(adr_path, &adr_st) == 0);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
-    if (!adr_exists) {
+    if (!adr_exists && !degraded) {
         yyjson_mut_obj_add_str(
             doc, root, "adr_hint",
             "Project indexed. Consider creating an Architecture Decision Record: "
@@ -2723,6 +2796,8 @@ static void build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                "Persistent artifact written to .codebase-memory/graph.db.zst. "
                                "Commit this file to share the index with teammates.");
     }
+
+    return degraded;
 }
 
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
@@ -2803,17 +2878,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
-    yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "indexed" : "error");
 
-    if (rc != 0) {
+    if (rc == 0) {
+        bool degraded = build_index_success_response(srv, doc, root, project_name, repo_path,
+                                                     persistence, p, excluded_dirs, excluded_count);
+        yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
+    } else {
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
                                "Pipeline failed. Check repo_path exists and contains source files. "
                                "Try mode='fast' for a quicker diagnostic run.");
-    }
-
-    if (rc == 0) {
-        build_index_success_response(srv, doc, root, project_name, repo_path, persistence,
-                                     excluded_dirs, excluded_count);
     }
 
     char *json = yy_doc_to_str(doc);
@@ -2953,6 +3027,75 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     return NULL;
 }
 
+static bool utf8_is_cont(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+static char *sanitize_utf8_lossy(const char *s) {
+    enum {
+        UTF8_REPLACEMENT_LEN = 3,
+        UTF8_THREE_BYTE_LEN = 3,
+        UTF8_FOUR_BYTE_LEN = 4,
+        UTF8_FOURTH_BYTE = 3,
+    };
+    if (!s) {
+        return NULL;
+    }
+    size_t len = strlen(s);
+    if (len > (((size_t)-1) - SKIP_ONE) / UTF8_REPLACEMENT_LEN) {
+        return NULL;
+    }
+    char *out = malloc(len * UTF8_REPLACEMENT_LEN + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *end = p + len;
+    unsigned char *dst = (unsigned char *)out;
+    while (p < end) {
+        unsigned char c = *p;
+        size_t n = 0;
+        if (c < 0x80) {
+            n = 1;
+        } else if (c >= 0xC2 && c <= 0xDF && p + 1 < end && utf8_is_cont(p[1])) {
+            n = 2;
+        } else if (c == 0xE0 && p + 2 < end && p[1] >= 0xA0 && p[1] <= 0xBF && utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c >= 0xE1 && c <= 0xEC && p + 2 < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c == 0xED && p + 2 < end && p[1] >= 0x80 && p[1] <= 0x9F && utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c >= 0xEE && c <= 0xEF && p + 2 < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2])) {
+            n = UTF8_THREE_BYTE_LEN;
+        } else if (c == 0xF0 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x90 && p[1] <= 0xBF &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        } else if (c >= 0xF1 && c <= 0xF3 && p + UTF8_FOURTH_BYTE < end && utf8_is_cont(p[1]) &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        } else if (c == 0xF4 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x80 && p[1] <= 0x8F &&
+                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+            n = UTF8_FOUR_BYTE_LEN;
+        }
+
+        if (n > 0) {
+            memcpy(dst, p, n);
+            dst += n;
+            p += n;
+        } else {
+            *dst++ = 0xEF;
+            *dst++ = 0xBF;
+            *dst++ = 0xBD;
+            p++;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
 /* Build an enriched snippet response for a resolved node. */
 /* Add a string array to a JSON object (no-op if count == 0). */
 static void add_string_array(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
@@ -2997,7 +3140,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
 
     if (source) {
-        yyjson_mut_obj_add_str(doc, root_obj, "source", source);
+        char *safe_source = sanitize_utf8_lossy(source);
+        if (safe_source) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "source", safe_source);
+            free(safe_source);
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
     }
@@ -4490,8 +4639,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         char db_check[CBM_SZ_1K];
         snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
                  srv->session_project);
-        struct stat st;
-        if (stat(db_check, &st) == 0) {
+        if (cbm_file_size(db_check) >= 0) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
                          srv->session_project);

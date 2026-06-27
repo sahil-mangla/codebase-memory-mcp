@@ -72,6 +72,10 @@ int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
  * to NULL/0 when p is NULL or nothing was excluded. Do not free. */
 void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count);
 
+/* Committed node/edge counts captured at dump time (-1 when dump did not run).
+ * Nodes are the #334 plausibility-gate axis; edges are informational only. */
+void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
+
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 
 /* Try to acquire the global index lock. Returns true if acquired,

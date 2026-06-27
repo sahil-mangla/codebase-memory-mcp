@@ -1500,11 +1500,11 @@ int cbm_remove_codex_mcp(const char *config_path) {
  * plus a leading newline). Returns a newly-malloc'd string the caller frees, or
  * NULL if no block was present (content is left untouched). */
 static char *codex_hook_strip(const char *content) {
-    char *begin = strstr(content, CODEX_HOOK_BEGIN);
+    const char *begin = strstr(content, CODEX_HOOK_BEGIN);
     if (!begin) {
         return NULL;
     }
-    char *end = strstr(begin, CODEX_HOOK_END);
+    const char *end = strstr(begin, CODEX_HOOK_END);
     if (!end) {
         return NULL;
     }
@@ -1513,7 +1513,7 @@ static char *codex_hook_strip(const char *content) {
         end++;
     }
     /* Drop one leading newline before the block, if any. */
-    char *cut = begin;
+    const char *cut = begin;
     if (cut > content && *(cut - CLI_SKIP_ONE) == '\n') {
         cut--;
     }

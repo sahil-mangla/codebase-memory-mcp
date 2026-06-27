@@ -111,7 +111,8 @@ FOUNDATION_SRCS = \
     src/foundation/compat_regex.c \
     src/foundation/mem.c \
     src/foundation/diagnostics.c \
-    src/foundation/profile.c
+    src/foundation/profile.c \
+    src/foundation/dump_verify.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -295,7 +296,8 @@ TEST_FOUNDATION_SRCS = \
     tests/test_str_intern.c \
     tests/test_log.c \
     tests/test_str_util.c \
-    tests/test_platform.c
+    tests/test_platform.c \
+    tests/test_dump_verify.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -313,7 +315,8 @@ TEST_STORE_SRCS = \
     tests/test_store_arch.c \
     tests/test_store_bulk.c \
     tests/test_store_pragmas.c \
-    tests/test_store_checkpoint.c
+    tests/test_store_checkpoint.c \
+    tests/test_dump_verify_io.c
 
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c
@@ -329,7 +332,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 

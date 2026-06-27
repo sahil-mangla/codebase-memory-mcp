@@ -11,6 +11,8 @@
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <stdio.h>
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -790,6 +792,91 @@ TEST(tool_get_architecture_emits_populated_sections) {
     PASS();
 }
 
+/* Regression for #604: path scopes architecture totals and content. */
+TEST(tool_get_architecture_path_scoping) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "arch-path";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/arch-path");
+
+    cbm_node_t pkg_global = {.project = proj,
+                             .label = "Package",
+                             .name = "Django",
+                             .qualified_name = "arch-path.Django",
+                             .file_path = "vendor/django/__init__.py"};
+    cbm_store_upsert_node(st, &pkg_global);
+
+    cbm_node_t pkg_local = {.project = proj,
+                            .label = "Package",
+                            .name = "hoa",
+                            .qualified_name = "arch-path.hoa",
+                            .file_path = "apps/hoa/main.go"};
+    cbm_store_upsert_node(st, &pkg_local);
+
+    cbm_node_t f_hoa = {.project = proj,
+                        .label = "File",
+                        .name = "main.go",
+                        .qualified_name = "arch-path.apps.hoa.main.go",
+                        .file_path = "apps/hoa/main.go"};
+    cbm_store_upsert_node(st, &f_hoa);
+
+    cbm_node_t f_other = {.project = proj,
+                          .label = "File",
+                          .name = "other.go",
+                          .qualified_name = "arch-path.other.go",
+                          .file_path = "lib/other.go"};
+    cbm_store_upsert_node(st, &f_other);
+
+    char *resp_root = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-path\",\"aspects\":[\"packages\"]}}}");
+    ASSERT_NOT_NULL(resp_root);
+    char *inner_root = extract_text_content(resp_root);
+    ASSERT_NOT_NULL(inner_root);
+    ASSERT_NOT_NULL(strstr(inner_root, "Django"));
+
+    char *resp_scoped = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch-path\",\"path\":\"apps/hoa\","
+             "\"aspects\":[\"packages\"]}}}");
+    ASSERT_NOT_NULL(resp_scoped);
+    char *inner_scoped = extract_text_content(resp_scoped);
+    ASSERT_NOT_NULL(inner_scoped);
+
+    ASSERT_NOT_NULL(strstr(inner_scoped, "root_total_nodes"));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "scoped_total_nodes"));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "\"path\""));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "hoa"));
+    ASSERT_NULL(strstr(inner_scoped, "Django"));
+
+    int root_nodes = 0;
+    int scoped_nodes = 0;
+    const char *rt = strstr(inner_scoped, "\"root_total_nodes\":");
+    const char *stn = strstr(inner_scoped, "\"scoped_total_nodes\":");
+    if (rt) {
+        sscanf(rt, "\"root_total_nodes\":%d", &root_nodes);
+    }
+    if (stn) {
+        sscanf(stn, "\"scoped_total_nodes\":%d", &scoped_nodes);
+    }
+    ASSERT_TRUE(root_nodes > scoped_nodes);
+    ASSERT_TRUE(scoped_nodes > 0);
+
+    free(inner_scoped);
+    free(resp_scoped);
+    free(inner_root);
+    free(resp_root);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_missing_query) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -1444,6 +1531,31 @@ static char *call_snippet(cbm_mcp_server_t *srv, const char *args_json) {
     return text;
 }
 
+static bool is_valid_json_response(const char *json) {
+    if (!json) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_doc_free(doc);
+    return true;
+}
+
+static bool snippet_source_has_replacement(const char *json) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *source = yyjson_obj_get(root, "source");
+    const char *source_str = yyjson_get_str(source);
+    bool found = source_str && strstr(source_str, "\xEF\xBF\xBD");
+    yyjson_doc_free(doc);
+    return found;
+}
+
 /* ── TestSnippet_ExactQN ──────────────────────────────────────── */
 
 TEST(snippet_exact_qn) {
@@ -1725,6 +1837,46 @@ TEST(snippet_include_neighbors_enabled) {
     ASSERT_NOT_NULL(strstr(resp, "Run"));
     free(resp);
 
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── TestSnippet_SourceInvalidUtf8 ────────────────────────────── */
+
+TEST(snippet_source_invalid_utf8) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const unsigned char source[] = {
+        'p',  'a',  'c', 'k', 'a', 'g',  'e',  ' ',  'm',  'a',  'i',  'n', '\n', '\n',
+        'f',  'u',  'n', 'c', ' ', 'H',  'a',  'n',  'd',  'l',  'e',  'R', 'e',  'q',
+        'u',  'e',  's', 't', '(', ')',  ' ',  'e',  'r',  'r',  'o',  'r', ' ',  '{',
+        '\n', '\t', '/', '/', ' ', 0xC0, 0xD4, 0xB7, 0xC2, '\n', '\t', 'r', 'e',  't',
+        'u',  'r',  'n', ' ', 'n', 'i',  'l',  '\n', '}',  '\n'};
+    ASSERT_EQ(fwrite(source, 1, sizeof(source), fp), sizeof(source));
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *raw =
+        cbm_mcp_handle_tool(srv, "get_code_snippet",
+                            "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                            "\"project\":\"test-project\"}");
+    ASSERT_TRUE(is_valid_json_response(raw));
+    char *resp = extract_text_content(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(is_valid_json_response(resp));
+    ASSERT_NULL(strstr(resp, "\xC0\xD4"));
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
+    ASSERT_NOT_NULL(strstr(resp, "return nil"));
+    ASSERT_TRUE(snippet_source_has_replacement(resp));
+
+    free(resp);
+    free(raw);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -2228,6 +2380,7 @@ SUITE(mcp) {
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
+    RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
     /* Pipeline-dependent tool handlers */
@@ -2285,5 +2438,6 @@ SUITE(mcp) {
     RUN_TEST(snippet_auto_resolve_enabled);
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
+    RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
 }

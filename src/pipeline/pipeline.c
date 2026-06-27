@@ -93,6 +93,14 @@ struct cbm_pipeline {
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
+
+    /* Committed graph size at dump time (-1 = dump did not run). #334 gate axis. */
+    int committed_nodes;
+    int committed_edges;
+
+    /* ADR (project_summaries) captured before a full-reindex DB delete, so it
+     * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
+    char *saved_adr;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -154,6 +162,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
     p->persistence = false;
+    p->committed_nodes = -1;
+    p->committed_edges = -1;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -176,6 +186,9 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
     free(p->branch_qn);
+    free(p->saved_adr); /* freed here too: error paths can exit before the
+                         * restore in dump_and_persist_hashes runs. Issue #516. */
+    p->saved_adr = NULL;
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -215,6 +228,22 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
     }
     if (count) {
         *count = p ? p->excluded_count : 0;
+    }
+}
+
+void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges) {
+    if (nodes) {
+        *nodes = p ? p->committed_nodes : -1;
+    }
+    if (edges) {
+        *edges = p ? p->committed_edges : -1;
+    }
+}
+
+void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) {
+    if (p) {
+        p->committed_nodes = nodes;
+        p->committed_edges = edges;
     }
 }
 
@@ -788,6 +817,22 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_store_close(check_store);
     }
     cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
+    /* Capture any ADR before deleting the DB so the full-reindex rebuild can
+     * restore it (project_summaries is otherwise lost). Issue #516. */
+    {
+        cbm_store_t *adr_store = cbm_store_open_path(db_path);
+        if (adr_store) {
+            cbm_adr_t existing;
+            if (cbm_store_adr_get(adr_store, p->project_name, &existing) == CBM_STORE_OK) {
+                if (existing.content) {
+                    free(p->saved_adr);
+                    p->saved_adr = strdup(existing.content);
+                }
+                cbm_store_adr_free(&existing);
+            }
+            cbm_store_close(adr_store);
+        }
+    }
     cbm_unlink(db_path);
     char wal[PL_WAL_BUF];
     char shm[PL_WAL_BUF];
@@ -832,6 +877,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         *last_slash = '\0';
         cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
     }
+    /* Capture committed counts BEFORE the dump. cbm_gbuf_dump_to_sqlite calls
+     * release_gbuf_indexes(), which frees node_by_qn (graph_buffer.c), after
+     * which cbm_gbuf_node_count() returns 0. Reading these post-dump left
+     * committed_nodes at 0, so the #334 plausibility gate never fired. */
+    p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
+    p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
     int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
@@ -841,6 +892,14 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         cbm_store_delete_file_hashes(hash_store, p->project_name);
+
+        /* Restore the ADR captured before the dump. Surface a failed restore
+         * rather than silently dropping the ADR (the original #516 symptom). */
+        if (p->saved_adr) {
+            if (cbm_store_adr_store(hash_store, p->project_name, p->saved_adr) != CBM_STORE_OK) {
+                cbm_log_error("pipeline.err", "phase", "adr_restore", "project", p->project_name);
+            }
+        }
         for (int i = 0; i < file_count; i++) {
             struct stat fst;
             if (stat(files[i].path, &fst) == 0) {
@@ -867,10 +926,18 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     }
+    free(p->saved_adr);
+    p->saved_adr = NULL;
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {
-        cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
+        int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
+        if (arc != 0) {
+            const char *err = cbm_artifact_export_last_error();
+            cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+            /* A failed persistence export intentionally fails the run; this used to be ignored. */
+            return arc;
+        }
     }
 
     return 0;

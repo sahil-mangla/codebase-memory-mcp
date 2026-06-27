@@ -23,7 +23,8 @@
 // Tree traversal limits.
 enum {
     TEMPLATE_DEPTH_LIMIT = 4,
-    DECLARATOR_DEPTH_LIMIT = 8,
+    DECLARATOR_DEPTH_LIMIT = CBM_DECLARATOR_DEPTH_LIMIT, // shared define in helpers.h
+
     EXPORT_ANCESTOR_DEPTH = 4,
     DECORATOR_SCAN_LIMIT = 3,
     C_RETURN_WALK_DEPTH = 5,
@@ -457,27 +458,6 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
     return null_node;
 }
 
-// Check if a node type is a terminal C declarator name.
-static bool is_c_terminal_name(const char *dk) {
-    return strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
-           strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0 ||
-           strcmp(dk, "destructor_name") == 0;
-}
-
-// Resolve name from a C++ qualified_identifier/scoped_identifier.
-static TSNode resolve_qualified_name(TSNode decl) {
-    static const char *name_kinds[] = {"operator_name", "operator_cast",    "destructor_name",
-                                       "identifier",    "field_identifier", NULL};
-    for (const char **k = name_kinds; *k; k++) {
-        TSNode found = cbm_find_child_by_kind(decl, *k);
-        if (!ts_node_is_null(found)) {
-            return found;
-        }
-    }
-    TSNode null_node = {0};
-    return null_node;
-}
-
 // C++/CUDA: out-of-line method definitions name the function with a qualified
 // declarator (`Foo::bar`, or `ns::Foo::bar`). Return the immediate enclosing
 // class name (the scope segment directly left of the function name, e.g. "Foo"),
@@ -526,30 +506,6 @@ static char *cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *
     }
     char *text = cbm_node_text(a, scope, source);
     return (text && text[0]) ? text : NULL;
-}
-
-// Resolve function name from C/C++/CUDA/GLSL declarator chain.
-static TSNode resolve_c_declarator_name(TSNode node) {
-    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
-    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
-        const char *dk = ts_node_type(decl);
-        if (is_c_terminal_name(dk)) {
-            return decl;
-        }
-        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
-            return resolve_qualified_name(decl);
-        }
-        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
-        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
-            inner = ts_node_named_child(decl, 0);
-        }
-        if (ts_node_is_null(inner)) {
-            break;
-        }
-        decl = inner;
-    }
-    TSNode null_node = {0};
-    return null_node;
 }
 
 // R: resolve function_definition name from parent binary_operator lhs.
@@ -675,7 +631,7 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
          lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
          lang == CBM_LANG_SLANG) &&
         strcmp(kind, "function_definition") == 0) {
-        return resolve_c_declarator_name(*node_ptr);
+        return cbm_resolve_c_declarator_name_node(*node_ptr);
     }
     TSNode null_node = {0};
     return null_node;
@@ -1202,6 +1158,16 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
     for (uint32_t ai = 0; ai < nc && ai < DECORATOR_SCAN_LIMIT; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg);
+        /* Kotlin wraps each annotation argument in a `value_argument` node
+         * (and supports the named form `value = "/x"`); unwrap to the string. */
+        if (strcmp(ak, "value_argument") == 0) {
+            TSNode s = cbm_find_child_by_kind(arg, "string_literal");
+            if (ts_node_is_null(s)) {
+                continue;
+            }
+            arg = s;
+            ak = ts_node_type(arg);
+        }
         if (strcmp(ak, "string") != 0 && strcmp(ak, "string_literal") != 0 &&
             strcmp(ak, "interpreted_string_literal") != 0) {
             continue;
@@ -1252,14 +1218,63 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
     return true;
 }
 
-/* Try to extract a route from a Java/JVM annotation node (`annotation` or
+/* Resolve an annotation's name node across grammars. Java exposes a `name`
+ * field; tree-sitter-kotlin does not — its annotation name lives in a nested
+ * type_identifier:
+ *   @Foo        -> (annotation (user_type (type_identifier)))
+ *   @Foo("/x")  -> (annotation (constructor_invocation (user_type (type_identifier))
+ *                                                      (value_arguments ...)))
+ * Returns a null node when no name can be resolved. */
+static TSNode annotation_name_node(TSNode annotation) {
+    TSNode name = ts_node_child_by_field_name(annotation, TS_FIELD("name"));
+    if (!ts_node_is_null(name)) {
+        return name;
+    }
+    TSNode ut = cbm_find_child_by_kind(annotation, "user_type");
+    if (ts_node_is_null(ut)) {
+        TSNode ci = cbm_find_child_by_kind(annotation, "constructor_invocation");
+        if (!ts_node_is_null(ci)) {
+            ut = cbm_find_child_by_kind(ci, "user_type");
+        }
+    }
+    if (!ts_node_is_null(ut)) {
+        TSNode ti = cbm_find_child_by_kind(ut, "type_identifier");
+        if (ts_node_is_null(ti)) {
+            ti = cbm_find_child_by_kind(ut, "simple_identifier");
+        }
+        return ti;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+/* Resolve an annotation's argument list across grammars. Kotlin keeps the args
+ * under a `constructor_invocation` child as a `value_arguments` node rather than
+ * the `arguments` field / `argument_list` child that Java exposes. */
+static TSNode annotation_args_node(TSNode annotation) {
+    TSNode args = ts_node_child_by_field_name(annotation, TS_FIELD("arguments"));
+    if (!ts_node_is_null(args)) {
+        return args;
+    }
+    args = find_decorator_args(annotation);
+    if (!ts_node_is_null(args)) {
+        return args;
+    }
+    TSNode ci = cbm_find_child_by_kind(annotation, "constructor_invocation");
+    if (!ts_node_is_null(ci)) {
+        return cbm_find_child_by_kind(ci, "value_arguments");
+    }
+    return args;
+}
+
+/* Try to extract a route from a Java/JVM/Kotlin annotation node (`annotation` or
  * `marker_annotation`). Spring mapping annotations carry the HTTP method in the
  * annotation name and the path in the (optional) argument list:
  *   @GetMapping("/orders")  @RequestMapping(value="/api")  @PostMapping
  * Returns true when the annotation is a route-mapping annotation. */
 static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char *source,
                                       const char **out_path, const char **out_method) {
-    TSNode name_node = ts_node_child_by_field_name(annotation, TS_FIELD("name"));
+    TSNode name_node = annotation_name_node(annotation);
     if (ts_node_is_null(name_node)) {
         return false;
     }
@@ -1268,10 +1283,7 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     if (!method) {
         return false;
     }
-    TSNode args = ts_node_child_by_field_name(annotation, TS_FIELD("arguments"));
-    if (ts_node_is_null(args)) {
-        args = find_decorator_args(annotation);
-    }
+    TSNode args = annotation_args_node(annotation);
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
         path = extract_route_path_from_args(a, args, source);
@@ -3267,6 +3279,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
